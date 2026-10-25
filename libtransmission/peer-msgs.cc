@@ -399,12 +399,19 @@ public:
         update_active();
     }
 
-    void cancel_block_request(tr_block_index_t block)
+    // Cancels the request with this peer only. The wishlist keeps
+    // treating the block as requested until SentCancel is published.
+    void withdraw_block_request(tr_block_index_t block)
     {
         cancels_sent_to_peer.add(tr_time(), 1);
         active_requests.unset(block);
-        publish(tr_peer_event::SentCancel(tor_.block_info(), block));
         protocol_send_cancel(peer_request::from_block(tor_, block));
+    }
+
+    void cancel_block_request(tr_block_index_t block)
+    {
+        withdraw_block_request(block);
+        publish(tr_peer_event::SentCancel(tor_.block_info(), block));
     }
 
     void maybe_cancel_block_request(tr_block_index_t block) override
@@ -585,7 +592,9 @@ private:
 
     void maybe_send_block_requests();
 
-    void check_request_timeout(time_t now);
+    // Withdraws timed-out requests and returns their blocks, which the
+    // caller must publish as SentCancel to make them requestable again.
+    [[nodiscard]] small::vector<tr_block_index_t> withdraw_timed_out_requests(time_t now);
 
     [[nodiscard]] constexpr auto client_reqq() const noexcept
     {
@@ -1875,9 +1884,15 @@ void tr_peerMsgsImpl::pulse()
     auto const now_sec = tr_time();
     auto const now_msec = tr_time_msec();
 
-    check_request_timeout(now_sec);
+    auto const timed_out = withdraw_timed_out_requests(now_sec);
     update_desired_request_count();
+    // Refill before the wishlist gets the timed-out blocks back,
+    // so that this peer cannot request them again and they go to other peers.
     maybe_send_block_requests();
+    for (auto const block : timed_out)
+    {
+        publish(tr_peer_event::SentCancel(tor_.block_info(), block));
+    }
     maybe_send_metadata_requests(now_sec);
     fill_output_buffer(now_sec, now_msec);
 }
@@ -1922,8 +1937,10 @@ void tr_peerMsgsImpl::maybe_send_block_requests()
     }
 }
 
-void tr_peerMsgsImpl::check_request_timeout(time_t const now)
+small::vector<tr_block_index_t> tr_peerMsgsImpl::withdraw_timed_out_requests(time_t const now)
 {
+    auto timed_out = small::vector<tr_block_index_t>{};
+
     std::sort(std::begin(request_timeouts_), std::end(request_timeouts_));
 
     for (auto it = std::begin(request_timeouts_); it != std::end(request_timeouts_);)
@@ -1947,13 +1964,16 @@ void tr_peerMsgsImpl::check_request_timeout(time_t const now)
         if (now >= timeout)
         {
             // request timed out, discard
-            cancel_block_request(block);
+            withdraw_block_request(block);
+            timed_out.push_back(block);
             it = request_timeouts_.erase(it);
             continue;
         }
 
         ++it;
     }
+
+    return timed_out;
 }
 
 [[nodiscard]] size_t tr_peerMsgsImpl::fill_output_buffer_impl(time_t now_sec, uint64_t now_msec)
